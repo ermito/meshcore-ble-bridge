@@ -20,7 +20,7 @@ Keep the `ble_client` section that already authenticates with the node, then add
 
 ```yaml
 external_components:
-  - source: github://matthew73210/meshcore-ble-bridge
+  - source: github://matthew73210/meshcore-ble-bridge@v0.1.0
     refresh: 1d
     components: [meshcore_ble_bridge]
 
