@@ -4,7 +4,6 @@
 
 #include "esphome/core/log.h"
 
-#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -23,6 +22,10 @@ static const char *const NUS_TX_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 void MeshCoreBLEBridge::setup() {
   this->setup_complete_ = true;
   this->tcp_rx_buffer_.reserve(MAX_TCP_BUFFER);
+  this->tcp_tx_buffer_.reserve(MAX_TCP_TX_BUFFER);
+  auto mtu_err = esp_ble_gatt_set_local_mtu(REQUESTED_ATT_MTU);
+  if (mtu_err != ESP_OK)
+    ESP_LOGW(TAG, "Unable to set local BLE MTU to %u, err=%d", REQUESTED_ATT_MTU, mtu_err);
   if (!this->start_server_()) {
     ESP_LOGE(TAG, "TCP bridge failed to start on port %u", this->port_);
   }
@@ -36,6 +39,8 @@ void MeshCoreBLEBridge::dump_config() {
   ESP_LOGCONFIG(TAG, "  Force encrypted BLE link: %s", YESNO(this->force_encryption_));
   ESP_LOGCONFIG(TAG, "  Wait for BLE auth: %s", YESNO(this->wait_for_auth_));
   ESP_LOGCONFIG(TAG, "  Write with response: %s", YESNO(this->write_with_response_));
+  ESP_LOGCONFIG(TAG, "  Requested BLE MTU: %u", REQUESTED_ATT_MTU);
+  ESP_LOGCONFIG(TAG, "  Negotiated BLE MTU: %u", this->negotiated_mtu_);
 }
 
 void MeshCoreBLEBridge::loop() {
@@ -44,6 +49,7 @@ void MeshCoreBLEBridge::loop() {
   if (this->server_fd_ < 0)
     this->start_server_();
   this->accept_client_();
+  this->flush_tcp_tx_();
   this->read_tcp_();
 }
 
@@ -52,10 +58,38 @@ void MeshCoreBLEBridge::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt
   switch (event) {
     case ESP_GATTC_CONNECT_EVT:
       this->reset_ble_state_();
+      this->negotiated_mtu_ = DEFAULT_ATT_MTU;
+      this->mtu_configured_ = false;
+      esp_ble_gatt_set_local_mtu(REQUESTED_ATT_MTU);
+      if (param->connect.conn_id == this->parent()->get_conn_id()) {
+        auto mtu_err = esp_ble_gattc_send_mtu_req(gattc_if, param->connect.conn_id);
+        if (mtu_err != ESP_OK)
+          ESP_LOGW(TAG, "BLE MTU request failed to start, err=%d", mtu_err);
+      }
       if (this->force_encryption_) {
         ESP_LOGD(TAG, "Requesting authenticated BLE encryption");
         esp_ble_set_encryption(this->parent()->get_remote_bda(), ESP_BLE_SEC_ENCRYPT_MITM);
       }
+      break;
+
+    case ESP_GATTC_CFG_MTU_EVT:
+      if (param->cfg_mtu.conn_id != this->parent()->get_conn_id())
+        break;
+      this->mtu_configured_ = true;
+      if (param->cfg_mtu.status == ESP_GATT_OK) {
+        this->negotiated_mtu_ = param->cfg_mtu.mtu;
+        ESP_LOGI(TAG, "BLE MTU negotiated: %u bytes (%u byte payload)", this->negotiated_mtu_,
+                 static_cast<unsigned>(this->ble_payload_limit_()));
+        if (this->ble_payload_limit_() < MAX_MESHCORE_PAYLOAD) {
+          ESP_LOGW(TAG, "BLE MTU payload %u is below MeshCore max payload %u; large messages may be rejected",
+                   static_cast<unsigned>(this->ble_payload_limit_()), static_cast<unsigned>(MAX_MESHCORE_PAYLOAD));
+        }
+      } else {
+        this->negotiated_mtu_ = DEFAULT_ATT_MTU;
+        ESP_LOGE(TAG, "BLE MTU negotiation failed, status=%d; only %u byte payloads are safe",
+                 param->cfg_mtu.status, static_cast<unsigned>(this->ble_payload_limit_()));
+      }
+      this->maybe_enable_notifications_();
       break;
 
     case ESP_GATTC_DISCONNECT_EVT:
@@ -91,7 +125,7 @@ void MeshCoreBLEBridge::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt
         uint8_t notify_enable[2] = {0x01, 0x00};
         auto err = esp_ble_gattc_write_char_descr(this->parent()->get_gattc_if(), this->parent()->get_conn_id(),
                                                   this->tx_cccd_handle_, sizeof(notify_enable), notify_enable,
-                                                  ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_MITM);
+                                                  ESP_GATT_WRITE_TYPE_RSP, this->auth_req_());
         if (err != ESP_GATT_OK)
           ESP_LOGE(TAG, "CCCD write request failed, err=%d", err);
       }
@@ -223,6 +257,8 @@ void MeshCoreBLEBridge::close_client_() {
   ::close(this->client_fd_);
   this->client_fd_ = -1;
   this->tcp_rx_buffer_.clear();
+  this->tcp_tx_buffer_.clear();
+  this->tcp_tx_offset_ = 0;
 }
 
 void MeshCoreBLEBridge::close_server_() {
@@ -298,10 +334,15 @@ void MeshCoreBLEBridge::write_ble_(const uint8_t *data, size_t len) {
     return;
   }
 
-  for (size_t offset = 0; offset < len; offset += BLE_WRITE_CHUNK) {
-    const size_t chunk_len = std::min(BLE_WRITE_CHUNK, len - offset);
-    this->ble_tx_queue_.emplace_back(data + offset, data + offset + chunk_len);
+  const size_t payload_limit = this->ble_payload_limit_();
+  if (len > payload_limit) {
+    ESP_LOGE(TAG, "MeshCore frame length %u exceeds negotiated BLE payload %u; closing TCP client",
+             static_cast<unsigned>(len), static_cast<unsigned>(payload_limit));
+    this->close_client_();
+    return;
   }
+
+  this->ble_tx_queue_.emplace_back(data, data + len);
   this->pump_ble_tx_queue_();
 }
 
@@ -316,7 +357,7 @@ void MeshCoreBLEBridge::pump_ble_tx_queue_() {
   this->ble_write_in_flight_ = this->write_with_response_;
   auto err = esp_ble_gattc_write_char(this->parent()->get_gattc_if(), this->parent()->get_conn_id(), this->rx_handle_,
                                       static_cast<uint16_t>(this->ble_tx_current_.size()),
-                                      this->ble_tx_current_.data(), write_type, ESP_GATT_AUTH_REQ_MITM);
+                                      this->ble_tx_current_.data(), write_type, this->auth_req_());
   if (err != ESP_GATT_OK) {
     ESP_LOGE(TAG, "BLE write request failed, err=%d", err);
     this->ble_write_in_flight_ = false;
@@ -333,41 +374,68 @@ void MeshCoreBLEBridge::send_to_tcp_(const uint8_t *data, size_t len) {
   if (this->client_fd_ < 0 || len > MAX_MESHCORE_PAYLOAD)
     return;
 
-  std::vector<uint8_t> frame;
-  frame.reserve(len + 3);
-  frame.push_back(0x3E);
-  frame.push_back(static_cast<uint8_t>(len & 0xFF));
-  frame.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
-  frame.insert(frame.end(), data, data + len);
-
-  if (!this->send_all_(frame.data(), frame.size())) {
-    ESP_LOGW(TAG, "TCP send failed; closing client");
-    this->close_client_();
+  if (this->tcp_tx_offset_ > 0) {
+    if (this->tcp_tx_offset_ < this->tcp_tx_buffer_.size()) {
+      this->tcp_tx_buffer_.erase(this->tcp_tx_buffer_.begin(), this->tcp_tx_buffer_.begin() + this->tcp_tx_offset_);
+    } else {
+      this->tcp_tx_buffer_.clear();
+    }
+    this->tcp_tx_offset_ = 0;
   }
+
+  const size_t frame_size = len + 3;
+  if (this->tcp_tx_buffer_.size() + frame_size > MAX_TCP_TX_BUFFER) {
+    ESP_LOGW(TAG, "TCP TX buffer overflow; closing client");
+    this->close_client_();
+    return;
+  }
+
+  this->tcp_tx_buffer_.push_back(0x3E);
+  this->tcp_tx_buffer_.push_back(static_cast<uint8_t>(len & 0xFF));
+  this->tcp_tx_buffer_.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
+  this->tcp_tx_buffer_.insert(this->tcp_tx_buffer_.end(), data, data + len);
+  this->flush_tcp_tx_();
 }
 
-bool MeshCoreBLEBridge::send_all_(const uint8_t *data, size_t len) {
-  size_t sent = 0;
-  while (sent < len) {
-    ssize_t written = ::send(this->client_fd_, data + sent, len - sent, 0);
+bool MeshCoreBLEBridge::flush_tcp_tx_() {
+  if (this->client_fd_ < 0)
+    return true;
+  if (this->tcp_tx_offset_ >= this->tcp_tx_buffer_.size()) {
+    this->tcp_tx_buffer_.clear();
+    this->tcp_tx_offset_ = 0;
+    return true;
+  }
+
+  while (this->tcp_tx_offset_ < this->tcp_tx_buffer_.size()) {
+    const uint8_t *data = this->tcp_tx_buffer_.data() + this->tcp_tx_offset_;
+    size_t len = this->tcp_tx_buffer_.size() - this->tcp_tx_offset_;
+    ssize_t written = ::send(this->client_fd_, data, len, 0);
     if (written > 0) {
-      sent += static_cast<size_t>(written);
+      this->tcp_tx_offset_ += static_cast<size_t>(written);
       continue;
     }
     if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-      return false;
+      return true;
+    ESP_LOGW(TAG, "TCP send failed, errno=%d; closing client", errno);
+    this->close_client_();
     return false;
   }
+
+  this->tcp_tx_buffer_.clear();
+  this->tcp_tx_offset_ = 0;
   return true;
 }
 
 void MeshCoreBLEBridge::reset_ble_state_() {
   this->auth_complete_ = false;
+  this->mtu_configured_ = false;
   this->ble_ready_ = false;
   this->notify_register_requested_ = false;
   this->ble_write_in_flight_ = false;
+  this->auth_wait_logged_ = false;
   this->ble_tx_current_.clear();
   this->ble_tx_queue_.clear();
+  this->negotiated_mtu_ = DEFAULT_ATT_MTU;
   this->rx_handle_ = 0;
   this->tx_handle_ = 0;
   this->tx_cccd_handle_ = 0;
@@ -462,9 +530,15 @@ bool MeshCoreBLEBridge::discover_handles_() {
 void MeshCoreBLEBridge::maybe_enable_notifications_() {
   if (this->rx_handle_ == 0 || this->tx_handle_ == 0)
     return;
-  if (this->wait_for_auth_ && !this->auth_complete_) {
-    ESP_LOGD(TAG, "Waiting for BLE authentication before enabling MeshCore notifications");
+  if (!this->mtu_configured_) {
+    ESP_LOGD(TAG, "Waiting for BLE MTU negotiation before enabling MeshCore notifications");
     return;
+  }
+  if (this->wait_for_auth_ && !this->auth_complete_) {
+    if (!this->auth_wait_logged_) {
+      ESP_LOGW(TAG, "BLE auth completion was not reported yet; enabling notifications with authenticated writes");
+      this->auth_wait_logged_ = true;
+    }
   }
   if (this->notify_register_requested_ || this->ble_ready_)
     return;
@@ -482,7 +556,18 @@ void MeshCoreBLEBridge::maybe_enable_notifications_() {
 void MeshCoreBLEBridge::mark_ble_ready_() {
   this->ble_ready_ = true;
   this->node_state = espbt::ClientState::ESTABLISHED;
-  ESP_LOGI(TAG, "MeshCore BLE bridge ready");
+  ESP_LOGI(TAG, "MeshCore BLE bridge ready, MTU=%u payload=%u", this->negotiated_mtu_,
+           static_cast<unsigned>(this->ble_payload_limit_()));
+}
+
+size_t MeshCoreBLEBridge::ble_payload_limit_() const {
+  if (this->negotiated_mtu_ <= 3)
+    return 20;
+  return this->negotiated_mtu_ - 3;
+}
+
+esp_gatt_auth_req_t MeshCoreBLEBridge::auth_req_() const {
+  return this->force_encryption_ ? ESP_GATT_AUTH_REQ_MITM : ESP_GATT_AUTH_REQ_NONE;
 }
 
 bool MeshCoreBLEBridge::address_matches_(const esp_bd_addr_t address) {

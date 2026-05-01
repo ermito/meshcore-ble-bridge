@@ -7,6 +7,7 @@
 #ifdef USE_ESP32
 
 #include <esp_gap_ble_api.h>
+#include <esp_gatt_common_api.h>
 #include <esp_gattc_api.h>
 
 #include <cstddef>
@@ -37,7 +38,9 @@ class MeshCoreBLEBridge : public Component, public ble_client::BLEClientNode {
  protected:
   static constexpr size_t MAX_MESHCORE_PAYLOAD = 300;
   static constexpr size_t MAX_TCP_BUFFER = 1024;
-  static constexpr size_t BLE_WRITE_CHUNK = 20;
+  static constexpr size_t MAX_TCP_TX_BUFFER = 4096;
+  static constexpr uint16_t DEFAULT_ATT_MTU = 23;
+  static constexpr uint16_t REQUESTED_ATT_MTU = 517;
 
   bool start_server_();
   void accept_client_();
@@ -48,12 +51,14 @@ class MeshCoreBLEBridge : public Component, public ble_client::BLEClientNode {
   void write_ble_(const uint8_t *data, size_t len);
   void pump_ble_tx_queue_();
   void send_to_tcp_(const uint8_t *data, size_t len);
-  bool send_all_(const uint8_t *data, size_t len);
+  bool flush_tcp_tx_();
 
   void reset_ble_state_();
   bool discover_handles_();
   void maybe_enable_notifications_();
   void mark_ble_ready_();
+  size_t ble_payload_limit_() const;
+  esp_gatt_auth_req_t auth_req_() const;
   bool address_matches_(const esp_bd_addr_t address);
   bool uuid_matches_(const esp_bt_uuid_t &actual, const char *expected);
   void set_nonblocking_(int fd);
@@ -68,13 +73,18 @@ class MeshCoreBLEBridge : public Component, public ble_client::BLEClientNode {
   int server_fd_{-1};
   int client_fd_{-1};
   std::vector<uint8_t> tcp_rx_buffer_;
+  std::vector<uint8_t> tcp_tx_buffer_;
+  size_t tcp_tx_offset_{0};
   std::vector<uint8_t> ble_tx_current_;
   std::vector<std::vector<uint8_t>> ble_tx_queue_;
 
   bool auth_complete_{false};
+  bool mtu_configured_{false};
   bool ble_ready_{false};
   bool ble_write_in_flight_{false};
   bool notify_register_requested_{false};
+  bool auth_wait_logged_{false};
+  uint16_t negotiated_mtu_{DEFAULT_ATT_MTU};
   uint16_t rx_handle_{0};
   uint16_t tx_handle_{0};
   uint16_t tx_cccd_handle_{0};
