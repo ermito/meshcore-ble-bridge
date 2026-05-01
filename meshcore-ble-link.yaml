@@ -3,9 +3,12 @@ esphome:
   friendly_name: Meshcore ble link
 
 external_components:
-  - source: github://matthew73210/meshcore-ble-bridge@v0.1.0
-    refresh: 1d
+  - source:
+      type: git
+      url: https://github.com/matthew73210/meshcore-ble-bridge
+      ref: main
     components: [meshcore_ble_bridge]
+    refresh: 0s
 
 esp32:
   board: esp32dev
@@ -27,11 +30,11 @@ logger:
 # Enable Home Assistant API
 api:
   encryption:
-    key: "xxx"
+    key: !secret meshcore_ble_link_api_key
 
 ota:
   - platform: esphome
-    password: "xxx"
+    password: !secret meshcore_ble_link_ota_password
 
 wifi:
   ssid: !secret wifi_ssid
@@ -40,7 +43,7 @@ wifi:
   # Enable fallback hotspot (captive portal) in case wifi connection fails
   ap:
     ssid: "Meshcore-Ble-Link"
-    password: "xxx"
+    password: !secret meshcore_ble_link_ap_password
 
 captive_portal:
 
@@ -50,7 +53,7 @@ esp32_ble_tracker:
     window: 1000ms
 
 ble_client:
-  - mac_address: xxx
+  - mac_address: AC:A7:04:07:CE:21
     id: meshcore_ble
     auto_connect: true
 
@@ -61,7 +64,7 @@ ble_client:
             level: DEBUG
         - ble_client.passkey_reply:
             id: meshcore_ble
-            passkey: xxx
+            passkey: !secret meshcore_ble_passkey
 
 meshcore_ble_bridge:
   id: meshcore_bridge
@@ -69,3 +72,4 @@ meshcore_ble_bridge:
   port: 5000
   force_encryption: true
   wait_for_auth: true
+    
