@@ -81,3 +81,12 @@ MeshCore TCP bridge listening on port 5000
 
 Then add or reconfigure MeshCore-HA with connection type `TCP`, using the ESPHome
 device address and port `5000`.
+
+## Project notes
+
+This component was coded through Codex.
+
+It is released under the MIT licence.
+
+MeshCore Home Assistant integration:
+[meshcore-dev/meshcore-ha](https://github.com/meshcore-dev/meshcore-ha)

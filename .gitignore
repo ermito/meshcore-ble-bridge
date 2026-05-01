@@ -1,0 +1,21 @@
+# ESPHome / PlatformIO build output
+.esphome/
+.pio/
+.platformio/
+build/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Logs and local environment
+*.log
+.env
+.env.*
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
