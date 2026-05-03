@@ -63,8 +63,13 @@ void MeshCoreBLEBridge::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt
       esp_ble_gatt_set_local_mtu(REQUESTED_ATT_MTU);
       if (param->connect.conn_id == this->parent()->get_conn_id()) {
         auto mtu_err = esp_ble_gattc_send_mtu_req(gattc_if, param->connect.conn_id);
-        if (mtu_err != ESP_OK)
-          ESP_LOGW(TAG, "BLE MTU request failed to start, err=%d", mtu_err);
+        if (mtu_err != ESP_OK) {
+          this->mtu_configured_ = true;
+          this->negotiated_mtu_ = DEFAULT_ATT_MTU;
+          ESP_LOGW(TAG, "BLE MTU request failed to start, err=%d; continuing with %u byte payload limit",
+                   mtu_err, static_cast<unsigned>(this->ble_payload_limit_()));
+          this->maybe_enable_notifications_();
+        }
       }
       if (this->force_encryption_) {
         ESP_LOGD(TAG, "Requesting authenticated BLE encryption");
@@ -558,6 +563,10 @@ void MeshCoreBLEBridge::mark_ble_ready_() {
   this->node_state = espbt::ClientState::ESTABLISHED;
   ESP_LOGI(TAG, "MeshCore BLE bridge ready, MTU=%u payload=%u", this->negotiated_mtu_,
            static_cast<unsigned>(this->ble_payload_limit_()));
+  if (this->ble_payload_limit_() < MAX_MESHCORE_PAYLOAD) {
+    ESP_LOGW(TAG, "BLE payload is below MeshCore TCP max payload %u; some Home Assistant entities may not update",
+             static_cast<unsigned>(MAX_MESHCORE_PAYLOAD));
+  }
 }
 
 size_t MeshCoreBLEBridge::ble_payload_limit_() const {
